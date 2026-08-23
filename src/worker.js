@@ -80,12 +80,11 @@ async function buildDedupHash(body) {
   return sha256Hex(JSON.stringify(normalized));
 }
 
-// 记录历史（瘦身版，防止 KV 1MB 限制超限）
 async function recordHistory(env, historyItem) {
+  if (!env.SUB_STORE) return;
   try {
     const raw = await env.SUB_STORE.get(HISTORY_INDEX_KEY);
     let list = raw ? JSON.parse(raw) : [];
-    // 过滤同 ID 记录，插入最新项
     list = list.filter((item) => item.id !== historyItem.id);
     list.unshift(historyItem);
     if (list.length > MAX_HISTORY_ITEMS) {
@@ -98,6 +97,10 @@ async function recordHistory(env, historyItem) {
 }
 
 async function handleGenerate(request, env, url) {
+  if (!env.SUB_STORE) {
+    return json({ ok: false, error: '未绑定 KV 命名空间 SUB_STORE，请在 Cloudflare 后台或 wrangler.toml 中绑定 KV' }, 500);
+  }
+
   let body;
   try {
     body = await request.json();
@@ -129,7 +132,6 @@ async function handleGenerate(request, env, url) {
 
   const createdAt = new Date().toISOString();
   
-  // 完整负载：写入单挑订阅的详情 KV
   const payload = {
     version: 1,
     createdAt,
@@ -155,10 +157,9 @@ async function handleGenerate(request, env, url) {
     await env.SUB_STORE.put(dedupKey, id, { expirationTtl: ttl });
   }
 
-  const accessToken = env.SUB_ACCESS_TOKEN || '';
+  const accessToken = String(env.SUB_ACCESS_TOKEN || '').trim();
   const urls = buildShareUrls(url.origin, id, accessToken);
 
-  // 写入历史摘要（丢弃胖文本 inputMeta）
   await recordHistory(env, {
     id,
     createdAt,
@@ -191,6 +192,7 @@ async function handleGenerate(request, env, url) {
 }
 
 async function handleGetHistory(env) {
+  if (!env.SUB_STORE) return json({ ok: true, list: [] });
   try {
     const raw = await env.SUB_STORE.get(HISTORY_INDEX_KEY);
     const list = raw ? JSON.parse(raw) : [];
@@ -201,6 +203,7 @@ async function handleGetHistory(env) {
 }
 
 async function handleGetDetail(url, env) {
+  if (!env.SUB_STORE) return json({ ok: false, error: '未绑定 KV 存储' }, 500);
   const id = url.searchParams.get('id');
   if (!id) return json({ ok: false, error: '缺少 ID 参数' }, 400);
 
@@ -216,6 +219,7 @@ async function handleGetDetail(url, env) {
 }
 
 async function handleDeleteHistory(url, env) {
+  if (!env.SUB_STORE) return json({ ok: false, error: '未绑定 KV 存储' }, 500);
   const id = url.searchParams.get('id');
   if (!id) return json({ ok: false, error: '缺少 ID 参数' }, 400);
 
@@ -233,23 +237,24 @@ async function handleDeleteHistory(url, env) {
   }
 }
 
-// 通用 /api/ 路由鉴权拦截器
 function checkApiAuth(url, request, env) {
-  const expected = env.SUB_ACCESS_TOKEN;
-  if (!expected) return null; // 服务端未配置，则放行
+  const expected = String(env.SUB_ACCESS_TOKEN || '').trim();
+  if (!expected) return null;
 
-  const provided = url.searchParams.get('token') || (request.headers.get('Authorization') || '').replace('Bearer ', '');
+  const provided = String(
+    url.searchParams.get('token') || (request.headers.get('Authorization') || '').replace('Bearer ', '')
+  ).trim();
+
   if (provided !== expected) {
     return json({ ok: false, error: '无权访问：Token 错误或未提供' }, 403);
   }
   return null;
 }
 
-// 订阅客户端拉取链接的专属鉴权
 function validateSubToken(url, env) {
-  const expected = env.SUB_ACCESS_TOKEN;
+  const expected = String(env.SUB_ACCESS_TOKEN || '').trim();
   if (!expected) return { ok: true };
-  const provided = url.searchParams.get('token') || '';
+  const provided = String(url.searchParams.get('token') || '').trim();
   if (!provided || provided !== expected) {
     return { ok: false, response: text('Forbidden: invalid token', 403) };
   }
@@ -259,6 +264,8 @@ function validateSubToken(url, env) {
 async function handleSub(request, url, env) {
   const tokenCheck = validateSubToken(url, env);
   if (!tokenCheck.ok) return tokenCheck.response;
+
+  if (!env.SUB_STORE) return text('KV SUB_STORE not bound', 500);
 
   const id = url.pathname.split('/')[2];
   if (!id) return text('missing id', 400);
@@ -286,43 +293,46 @@ async function handleSub(request, url, env) {
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
+    try {
+      const url = new URL(request.url);
 
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'access-control-allow-origin': '*',
-          'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
-          'access-control-allow-headers': 'content-type, authorization',
-        },
-      });
+      if (request.method === 'OPTIONS') {
+        return new Response(null, {
+          headers: {
+            'access-control-allow-origin': '*',
+            'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
+            'access-control-allow-headers': 'content-type, authorization',
+          },
+        });
+      }
+
+      if (url.pathname.startsWith('/api/')) {
+        const authError = checkApiAuth(url, request, env);
+        if (authError) return authError;
+
+        if (request.method === 'POST' && url.pathname === '/api/generate') {
+          return handleGenerate(request, env, url);
+        }
+        if (request.method === 'GET' && url.pathname === '/api/history') {
+          return handleGetHistory(env);
+        }
+        if (request.method === 'DELETE' && url.pathname === '/api/history') {
+          return handleDeleteHistory(url, env);
+        }
+        if (request.method === 'GET' && url.pathname === '/api/detail') {
+          return handleGetDetail(url, env);
+        }
+        
+        return json({ ok: false, error: '接口不存在' }, 404);
+      }
+
+      if (request.method === 'GET' && url.pathname.startsWith('/sub/')) {
+        return handleSub(request, url, env);
+      }
+
+      return env.ASSETS.fetch(request);
+    } catch (fatalErr) {
+      return json({ ok: false, error: `Worker 运行错误: ${fatalErr.message || fatalErr}` }, 500);
     }
-
-    // 后台管理 API 统一防护网关
-    if (url.pathname.startsWith('/api/')) {
-      const authError = checkApiAuth(url, request, env);
-      if (authError) return authError;
-
-      if (request.method === 'POST' && url.pathname === '/api/generate') {
-        return handleGenerate(request, env, url);
-      }
-      if (request.method === 'GET' && url.pathname === '/api/history') {
-        return handleGetHistory(env);
-      }
-      if (request.method === 'DELETE' && url.pathname === '/api/history') {
-        return handleDeleteHistory(url, env);
-      }
-      if (request.method === 'GET' && url.pathname === '/api/detail') {
-        return handleGetDetail(url, env);
-      }
-      
-      return json({ ok: false, error: '接口不存在' }, 404);
-    }
-
-    if (request.method === 'GET' && url.pathname.startsWith('/sub/')) {
-      return handleSub(request, url, env);
-    }
-
-    return env.ASSETS.fetch(request);
   },
 };
