@@ -68,11 +68,19 @@ fillDemoBtn.addEventListener('click', () => {
 });
 
 // 加载历史记录
+// 优化后的加载历史逻辑：未填 Token 时静默提示
 async function loadHistory() {
+  const token = apiTokenInput?.value.trim() || '';
   try {
     const res = await fetch(getApiUrl('/api/history'));
     const data = await res.json();
-    if (!res.ok || !data.ok) throw new Error(data.error || '获取历史失败');
+    if (!res.ok || !data.ok) {
+      if (res.status === 403 || data.error?.includes('Token')) {
+        historyContainer.innerHTML = '<div class="empty-state">🔒 请在上方填写「访问凭证 Token」后点击「刷新记录」查看历史</div>';
+        return;
+      }
+      throw new Error(data.error || '获取历史失败');
+    }
     globalHistoryList = data.list || [];
     renderHistoryView(globalHistoryList);
   } catch (err) {
