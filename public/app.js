@@ -9,12 +9,10 @@ function escapeHtml(value) {
 
 const apiTokenInput = document.getElementById('apiToken');
 
-// 页面加载时恢复本地保存的 Token
 if (localStorage.getItem('cf_sub_token')) {
   apiTokenInput.value = localStorage.getItem('cf_sub_token');
 }
 
-// 统一的 API 路由拼接器：自动携带 Token 与其他参数
 function getApiUrl(path, extraParams = '') {
   const token = apiTokenInput?.value.trim() || '';
   if (token) localStorage.setItem('cf_sub_token', token);
@@ -25,6 +23,22 @@ function getApiUrl(path, extraParams = '') {
     qs += qs ? `&${extraParams}` : extraParams;
   }
   return path + (qs ? `?${qs}` : '');
+}
+
+async function safeFetchJson(url, options = {}) {
+  const res = await fetch(url, options);
+  const contentType = res.headers.get('content-type') || '';
+  
+  if (contentType.includes('application/json')) {
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      throw new Error(data.error || `请求失败 (${res.status})`);
+    }
+    return data;
+  } else {
+    const text = await res.text();
+    throw new Error(`服务异常 (${res.status})：${text.slice(0, 100)}`);
+  }
 }
 
 const form = document.getElementById('generator-form');
@@ -67,24 +81,17 @@ fillDemoBtn.addEventListener('click', () => {
   document.getElementById('keepOriginalHost').checked = true;
 });
 
-// 加载历史记录
-// 优化后的加载历史逻辑：未填 Token 时静默提示
 async function loadHistory() {
-  const token = apiTokenInput?.value.trim() || '';
   try {
-    const res = await fetch(getApiUrl('/api/history'));
-    const data = await res.json();
-    if (!res.ok || !data.ok) {
-      if (res.status === 403 || data.error?.includes('Token')) {
-        historyContainer.innerHTML = '<div class="empty-state">🔒 请在上方填写「访问凭证 Token」后点击「刷新记录」查看历史</div>';
-        return;
-      }
-      throw new Error(data.error || '获取历史失败');
-    }
+    const data = await safeFetchJson(getApiUrl('/api/history'));
     globalHistoryList = data.list || [];
     renderHistoryView(globalHistoryList);
   } catch (err) {
-    historyContainer.innerHTML = `<div class="empty-state">加载历史记录失败：${escapeHtml(err.message)}</div>`;
+    if (err.message.includes('Token')) {
+      historyContainer.innerHTML = '<div class="empty-state">🔒 请在上方填入「访问凭证 Token」后点击「刷新记录」</div>';
+    } else {
+      historyContainer.innerHTML = `<div class="empty-state">加载历史记录失败：${escapeHtml(err.message)}</div>`;
+    }
   }
 }
 
@@ -141,19 +148,14 @@ window.restoreHistory = async function(id, btnElement) {
       btnElement.disabled = true;
     }
 
-    const res = await fetch(getApiUrl('/api/detail', `id=${encodeURIComponent(id)}`));
-    const data = await res.json();
-    
-    if (!res.ok || !data.ok) throw new Error(data.error || '获取详情失败');
+    const data = await safeFetchJson(getApiUrl('/api/detail', `id=${encodeURIComponent(id)}`));
     if (!data.inputMeta) throw new Error('数据结构异常，无法恢复');
 
-    // 回填表单
     document.getElementById('nodeLinks').value = data.inputMeta.nodeLinks || '';
     document.getElementById('preferredIps').value = data.inputMeta.preferredIps || '';
     document.getElementById('namePrefix').value = data.inputMeta.namePrefix || '';
     document.getElementById('keepOriginalHost').checked = data.inputMeta.keepOriginalHost !== false;
 
-    // 页面平滑滚动回表单顶部
     form.scrollIntoView({ behavior: 'smooth', block: 'start' });
     
     if (btnElement) {
@@ -172,9 +174,7 @@ window.restoreHistory = async function(id, btnElement) {
 window.deleteHistory = async function(id) {
   if (!confirm('确定要删除这条历史生成记录吗？')) return;
   try {
-    const res = await fetch(getApiUrl('/api/history', `id=${encodeURIComponent(id)}`), { method: 'DELETE' });
-    const data = await res.json();
-    if (!res.ok || !data.ok) throw new Error(data.error || '删除失败');
+    await safeFetchJson(getApiUrl('/api/history', `id=${encodeURIComponent(id)}`), { method: 'DELETE' });
     loadHistory();
   } catch (err) {
     alert(err.message);
@@ -192,7 +192,6 @@ window.copyText = async function(text) {
 
 refreshHistoryBtn.addEventListener('click', loadHistory);
 
-// 生成提交
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   warningBox.classList.add('hidden');
@@ -209,18 +208,13 @@ form.addEventListener('submit', async (event) => {
   submitBtn.textContent = '生成中...';
 
   try {
-    const response = await fetch(getApiUrl('/api/generate'), {
+    const data = await safeFetchJson(getApiUrl('/api/generate'), {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
       },
       body: JSON.stringify(payload),
     });
-
-    const data = await response.json();
-    if (!response.ok || !data.ok) {
-      throw new Error(data.error || '生成失败');
-    }
 
     autoUrl.value = data.urls.auto;
     rawUrl.value = data.urls.raw;
@@ -264,7 +258,6 @@ form.addEventListener('submit', async (event) => {
   }
 });
 
-// 复制 / 二维码逻辑
 document.addEventListener('click', async (event) => {
   const copyButton = event.target.closest('[data-copy-target]');
   if (copyButton) {
@@ -327,5 +320,4 @@ function closeQrDialog() {
   qrCanvas.innerHTML = '';
 }
 
-// 页面载入时执行历史读取
 loadHistory();
