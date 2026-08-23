@@ -30,7 +30,7 @@ export function detectTarget(userAgent = '', explicitTarget = '') {
   }
 
   const ua = String(userAgent || '').toLowerCase();
-  if (/clash|mihomo|stash|nekobox|meta/.test(ua)) {
+  if (/clash|mihomo|stash|nekobox|meta|verge|flclash/.test(ua)) {
     return 'clash';
   }
   if (/surge/.test(ua)) {
@@ -39,48 +39,21 @@ export function detectTarget(userAgent = '', explicitTarget = '') {
   return 'raw';
 }
 
-export function buildShareUrls(origin, token) {
+export function buildShareUrls(origin, token, accessToken = '') {
+  const tokenQuery = accessToken ? `token=${encodeURIComponent(accessToken)}` : '';
+  const appendParam = (base, param) => {
+    const joinChar = base.includes('?') ? '&' : '?';
+    return param ? `${base}${joinChar}${param}` : base;
+  };
+
   const base = `${origin}/sub/${token}`;
   return {
-    auto: base,
-    raw: `${base}?target=raw`,
-    clash: `${base}?target=clash`,
-    surge: `${base}?target=surge`,
-    json: `${base}?target=json`,
+    auto: appendParam(base, tokenQuery),
+    raw: appendParam(`${base}?target=raw`, tokenQuery),
+    clash: appendParam(`${base}?target=clash`, tokenQuery),
+    surge: appendParam(`${base}?target=surge`, tokenQuery),
+    json: appendParam(`${base}?target=json`, tokenQuery),
   };
-}
-
-export async function encryptPayload(payload, secret) {
-  const key = await getAesKey(secret);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const plainBytes = textEncoder.encode(JSON.stringify(payload));
-  const cipherBytes = new Uint8Array(
-    await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plainBytes),
-  );
-
-  const merged = new Uint8Array(iv.length + cipherBytes.length);
-  merged.set(iv, 0);
-  merged.set(cipherBytes, iv.length);
-  return bytesToBase64Url(merged);
-}
-
-export async function decryptPayload(token, secret) {
-  const bytes = base64UrlToBytes(token);
-  if (bytes.length <= 12) {
-    throw new Error('订阅令牌无效。');
-  }
-  const iv = bytes.slice(0, 12);
-  const cipher = bytes.slice(12);
-  const key = await getAesKey(secret);
-  const plainBuffer = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, cipher);
-  const json = textDecoder.decode(plainBuffer);
-  return JSON.parse(json);
-}
-
-async function getAesKey(secret) {
-  const normalized = ensureSecret(secret);
-  const digest = await crypto.subtle.digest('SHA-256', textEncoder.encode(normalized));
-  return crypto.subtle.importKey('raw', digest, 'AES-GCM', false, ['encrypt', 'decrypt']);
 }
 
 export function parseNodeLinks(inputText) {
@@ -228,7 +201,11 @@ export function renderSubscription(target, nodes, requestUrl) {
         filename: 'subscription.json',
       };
     default:
-      throw new Error(`不支持的订阅输出格式：${target}`);
+      return {
+        body: renderRawSubscription(nodes),
+        contentType: 'text/plain; charset=utf-8',
+        filename: 'subscription.txt',
+      };
   }
 }
 
@@ -240,7 +217,7 @@ export function renderRawSubscription(nodes) {
 export function renderClashSubscription(nodes) {
   const supportedNodes = nodes.filter(isClashSupportedNode);
   if (!supportedNodes.length) {
-    throw new Error('没有可导出为 Clash 的节点。当前版本主要支持 VMess/VLESS/Trojan 的 WS/TCP/GRPC/HTTP 常见格式。');
+    throw new Error('没有可导出为 Clash 的节点。');
   }
 
   const proxyNames = supportedNodes.map((node) => node.name);
@@ -251,6 +228,7 @@ export function renderClashSubscription(nodes) {
     'mode: rule',
     'log-level: info',
     'ipv6: false',
+    '',
     'proxies:',
   ];
 
@@ -258,16 +236,19 @@ export function renderClashSubscription(nodes) {
     lines.push(...renderClashProxy(node));
   });
 
+  lines.push('');
   lines.push('proxy-groups:');
   lines.push('  - name: "🚀 节点选择"');
   lines.push('    type: select');
   lines.push(`    proxies: ["♻️ 自动选择", ${proxyNames.map(yamlQuote).join(', ')}]`);
+  lines.push('');
   lines.push('  - name: "♻️ 自动选择"');
   lines.push('    type: url-test');
   lines.push(`    url: ${yamlQuote(DEFAULT_TEST_URL)}`);
   lines.push('    interval: 300');
   lines.push('    tolerance: 50');
   lines.push(`    proxies: [${proxyNames.map(yamlQuote).join(', ')}]`);
+  lines.push('');
   lines.push('rules:');
   lines.push('  - MATCH,🚀 节点选择');
 
@@ -277,7 +258,7 @@ export function renderClashSubscription(nodes) {
 export function renderSurgeSubscription(nodes, requestUrl) {
   const supportedNodes = nodes.filter((node) => node.type === 'vmess' || node.type === 'trojan');
   if (!supportedNodes.length) {
-    throw new Error('当前 Surge 导出仅支持 VMess / Trojan 节点。你的示例 VMess 节点可以正常使用该导出。');
+    throw new Error('当前 Surge 导出仅支持 VMess / Trojan 节点。');
   }
 
   const proxyNames = supportedNodes.map((node) => sanitizeSurgeName(node.name));
@@ -332,7 +313,7 @@ export function renderVmessUri(node) {
     aid: String(node.alterId ?? 0),
     scy: node.cipher || 'auto',
     net: node.network || 'ws',
-    type: node.headerType || '',
+    type: node.headerType || 'none',
     host: node.hostHeader || '',
     path: node.path || '/',
     tls: node.tls ? (node.security || 'tls') : '',
@@ -360,8 +341,6 @@ export function renderVlessUri(node) {
   setQueryParam(params, 'alpn', node.alpn?.length ? node.alpn.join(',') : '');
   setQueryParam(params, 'fp', node.fp || '');
   setQueryParam(params, 'flow', node.flow || '');
-  setQueryParam(params, 'serviceName', node.serviceName || '');
-  setQueryParam(params, 'authority', node.authority || '');
   const hash = node.name ? `#${encodeURIComponent(node.name)}` : '';
   return `vless://${encodeURIComponent(node.uuid)}@${formatHostForUrl(node.server)}:${node.port}?${params.toString()}${hash}`;
 }
@@ -379,8 +358,6 @@ export function renderTrojanUri(node) {
   setQueryParam(params, 'sni', node.sni || '');
   setQueryParam(params, 'alpn', node.alpn?.length ? node.alpn.join(',') : '');
   setQueryParam(params, 'fp', node.fp || '');
-  setQueryParam(params, 'serviceName', node.serviceName || '');
-  setQueryParam(params, 'authority', node.authority || '');
   const hash = node.name ? `#${encodeURIComponent(node.name)}` : '';
   return `trojan://${encodeURIComponent(node.password)}@${formatHostForUrl(node.server)}:${node.port}?${params.toString()}${hash}`;
 }
@@ -398,9 +375,7 @@ function maybeExpandRawSubscription(inputText) {
     if (decoded.includes('://')) {
       return decoded;
     }
-  } catch {
-    // ignore
-  }
+  } catch {}
   return text;
 }
 
@@ -481,8 +456,6 @@ function parseVlessUri(uri) {
     fp: String(params.fp || '').trim(),
     allowInsecure: toBoolean(params.allowInsecure || params.insecure),
     flow: String(params.flow || '').trim(),
-    serviceName: String(params.serviceName || '').trim(),
-    authority: String(params.authority || '').trim(),
     encryption: String(params.encryption || 'none').trim() || 'none',
     params,
   };
@@ -515,41 +488,30 @@ function parseTrojanUri(uri) {
     alpn: splitListValue(params.alpn),
     fp: String(params.fp || '').trim(),
     allowInsecure: toBoolean(params.allowInsecure || params.insecure),
-    serviceName: String(params.serviceName || '').trim(),
-    authority: String(params.authority || '').trim(),
     params,
   };
 }
 
 function parseEndpoint(rawLine) {
   const raw = String(rawLine || '').trim();
-  if (!raw) {
-    throw new Error('优选地址为空');
-  }
+  if (!raw) throw new Error('优选地址为空');
 
   const hashIndex = raw.indexOf('#');
   const hostPart = hashIndex >= 0 ? raw.slice(0, hashIndex).trim() : raw;
   const label = hashIndex >= 0 ? raw.slice(hashIndex + 1).trim() : '';
   const { host, port } = splitHostAndPort(hostPart);
 
-  if (!host) {
-    throw new Error(`无效地址：${raw}`);
-  }
-
+  if (!host) throw new Error(`无效地址：${raw}`);
   return { host, port, label };
 }
 
 function splitHostAndPort(input) {
   const value = String(input || '').trim();
-  if (!value) {
-    return { host: '', port: undefined };
-  }
+  if (!value) return { host: '', port: undefined };
 
   if (value.startsWith('[')) {
     const match = value.match(/^\[([^\]]+)](?::(\d+))?$/);
-    if (!match) {
-      throw new Error(`IPv6 地址格式错误：${value}`);
-    }
+    if (!match) throw new Error(`IPv6 地址格式错误：${value}`);
     return {
       host: match[1],
       port: match[2] ? normalizePort(match[2]) : undefined,
@@ -557,10 +519,7 @@ function splitHostAndPort(input) {
   }
 
   const colonCount = (value.match(/:/g) || []).length;
-  if (colonCount > 1) {
-    // 视为裸 IPv6，不拆端口
-    return { host: value, port: undefined };
-  }
+  if (colonCount > 1) return { host: value, port: undefined };
 
   const parts = value.split(':');
   if (parts.length === 2 && /^\d+$/.test(parts[1])) {
@@ -583,6 +542,7 @@ function renderClashProxy(node) {
   }
   if (node.type === 'vless') {
     lines.push(`    uuid: ${yamlQuote(node.uuid)}`);
+    lines.push('    cipher: zero');
     if (node.flow) {
       lines.push(`    flow: ${yamlQuote(node.flow)}`);
     }
@@ -611,23 +571,9 @@ function renderClashProxy(node) {
   if (node.network === 'ws') {
     lines.push('    ws-opts:');
     lines.push(`      path: ${yamlQuote(node.path || '/')}`);
-    if (node.hostHeader) {
+    if (node.hostHeader || node.sni) {
       lines.push('      headers:');
-      lines.push(`        Host: ${yamlQuote(node.hostHeader)}`);
-    }
-  }
-
-  if (node.network === 'grpc') {
-    lines.push('    grpc-opts:');
-    lines.push(`      grpc-service-name: ${yamlQuote(node.serviceName || '')}`);
-  }
-
-  if (node.network === 'http' || node.network === 'h2') {
-    lines.push('    http-opts:');
-    lines.push(`      path: [${yamlQuote(node.path || '/')}]`);
-    if (node.hostHeader) {
-      lines.push('      headers:');
-      lines.push(`        Host: [${yamlQuote(node.hostHeader)}]`);
+      lines.push(`        Host: ${yamlQuote(node.hostHeader || node.sni)}`);
     }
   }
 
@@ -644,9 +590,7 @@ function renderSurgeProxy(node) {
       `skip-cert-verify=${node.allowInsecure ? 'true' : 'false'}`,
     ];
     const sni = getEffectiveTlsHost(node);
-    if (sni) {
-      params.push(`sni=${sni}`);
-    }
+    if (sni) params.push(`sni=${sni}`);
     if (node.network === 'ws') {
       params.push('ws=true');
       params.push(`ws-path=${node.path || '/'}`);
@@ -657,13 +601,12 @@ function renderSurgeProxy(node) {
     return `${name} = vmess, ${formatHostForUrl(node.server)}, ${node.port}, ${params.join(', ')}`;
   }
 
-  const trojanParams = [];
-  trojanParams.push(`password=${node.password}`);
-  trojanParams.push(`skip-cert-verify=${node.allowInsecure ? 'true' : 'false'}`);
+  const trojanParams = [
+    `password=${node.password}`,
+    `skip-cert-verify=${node.allowInsecure ? 'true' : 'false'}`
+  ];
   const sni = getEffectiveTlsHost(node);
-  if (sni) {
-    trojanParams.push(`sni=${sni}`);
-  }
+  if (sni) trojanParams.push(`sni=${sni}`);
   if (node.network === 'ws') {
     trojanParams.push('ws=true');
     trojanParams.push(`ws-path=${node.path || '/'}`);
@@ -695,9 +638,7 @@ function isTlsEnabled(value) {
 
 function decodeHashName(hash) {
   const raw = String(hash || '').replace(/^#/, '');
-  if (!raw) {
-    return '';
-  }
+  if (!raw) return '';
   try {
     return decodeURIComponent(raw);
   } catch {
@@ -707,12 +648,8 @@ function decodeHashName(hash) {
 
 function normalizePort(value, fallback) {
   const number = Number.parseInt(String(value || ''), 10);
-  if (Number.isInteger(number) && number >= 1 && number <= 65535) {
-    return number;
-  }
-  if (fallback !== undefined) {
-    return fallback;
-  }
+  if (Number.isInteger(number) && number >= 1 && number <= 65535) return number;
+  if (fallback !== undefined) return fallback;
   throw new Error(`端口无效：${value}`);
 }
 
@@ -723,20 +660,13 @@ function normalizeInteger(value, fallback = 0) {
 
 function normalizePath(value) {
   const text = String(value || '').trim();
-  if (!text) {
-    return '/';
-  }
+  if (!text) return '/';
   return text.startsWith('/') ? text : `/${text}`;
 }
 
 function splitListValue(value) {
-  if (Array.isArray(value)) {
-    return value.map((item) => String(item).trim()).filter(Boolean);
-  }
-  return String(value || '')
-    .split(/[\n,]+/)
-    .map((item) => item.trim())
-    .filter(Boolean);
+  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
+  return String(value || '').split(/[\n,]+/).map((item) => item.trim()).filter(Boolean);
 }
 
 function formatHostForUrl(host) {
@@ -748,11 +678,8 @@ function formatHostForUrl(host) {
 
 function setQueryParam(params, key, value) {
   const normalized = String(value || '').trim();
-  if (normalized) {
-    params.set(key, normalized);
-  } else {
-    params.delete(key);
-  }
+  if (normalized) params.set(key, normalized);
+  else params.delete(key);
 }
 
 function yamlQuote(value) {
@@ -761,11 +688,7 @@ function yamlQuote(value) {
 }
 
 function sanitizeSurgeName(name) {
-  return String(name || 'proxy')
-    .replace(/[\r\n]/g, ' ')
-    .replace(/,/g, '，')
-    .replace(/=/g, '＝')
-    .trim();
+  return String(name || 'proxy').replace(/[\r\n]/g, ' ').replace(/,/g, '，').replace(/=/g, '＝').trim();
 }
 
 function escapeSurgeHeader(value) {
@@ -811,12 +734,4 @@ function base64ToBytes(base64Text) {
     bytes[index] = binary.charCodeAt(index);
   }
   return bytes;
-}
-
-function bytesToBase64Url(bytes) {
-  return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-}
-
-function base64UrlToBytes(text) {
-  return base64ToBytes(normalizeBase64(text));
 }
