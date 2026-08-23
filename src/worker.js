@@ -1,9 +1,15 @@
-// Cloudflare Worker: KV short link subscription + access token protection
-// Requires:
-// - KV namespace binding: SUB_STORE
-// - Secret/Variable: SUB_ACCESS_TOKEN
-// Optional:
-// - Secret/Variable: SUB_LINK_SECRET (legacy long-token compatibility)
+import {
+  parseNodeLinks,
+  parsePreferredEndpoints,
+  expandNodes,
+  summarizeNodes,
+  renderSubscription,
+  detectTarget,
+  buildShareUrls
+} from './core.js';
+
+const HISTORY_INDEX_KEY = 'sub:history:index';
+const MAX_HISTORY_ITEMS = 30;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -11,380 +17,21 @@ function json(data, status = 200) {
     headers: {
       'content-type': 'application/json; charset=utf-8',
       'access-control-allow-origin': '*',
-      'access-control-allow-methods': 'GET,POST,OPTIONS',
-      'access-control-allow-headers': 'content-type',
+      'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
+      'access-control-allow-headers': 'content-type, authorization',
     },
   });
 }
 
-function text(body, status = 200, contentType = 'text/plain; charset=utf-8') {
+function text(body, status = 200, contentType = 'text/plain; charset=utf-8', headers = {}) {
   return new Response(body, {
     status,
     headers: {
       'content-type': contentType,
       'access-control-allow-origin': '*',
+      ...headers,
     },
   });
-}
-
-function b64EncodeUtf8(str) {
-  return btoa(unescape(encodeURIComponent(str)));
-}
-
-function b64DecodeUtf8(str) {
-  return decodeURIComponent(escape(atob(str)));
-}
-
-function escapeYaml(str = '') {
-  return String(str)
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, ' ');
-}
-
-function parsePreferredEndpoints(input) {
-  return String(input || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const [raw, remark = ''] = line.split('#');
-      const value = raw.trim();
-      const hashRemark = remark.trim();
-      const match = value.match(/^(.*?)(?::(\d+))?$/);
-      return {
-        server: match?.[1] || value,
-        port: match?.[2] ? Number(match[2]) : undefined,
-        remark: hashRemark,
-      };
-    });
-}
-
-function parseVmess(link) {
-  const raw = link.slice('vmess://'.length).trim();
-  const obj = JSON.parse(b64DecodeUtf8(raw));
-  return {
-    type: 'vmess',
-    name: obj.ps || 'vmess',
-    server: obj.add,
-    port: Number(obj.port || 443),
-    uuid: obj.id,
-    cipher: obj.scy || 'auto',
-    network: obj.net || 'ws',
-    tls: obj.tls === 'tls',
-    host: obj.host || '',
-    path: obj.path || '/',
-    sni: obj.sni || obj.host || '',
-    alpn: obj.alpn || '',
-    fp: obj.fp || '',
-  };
-}
-
-function parseUrlLike(link, type) {
-  const u = new URL(link);
-  return {
-    type,
-    name: decodeURIComponent(u.hash.replace(/^#/, '')) || type,
-    server: u.hostname,
-    port: Number(u.port || 443),
-    password: type === 'trojan' ? decodeURIComponent(u.username) : undefined,
-    uuid: type === 'vless' ? decodeURIComponent(u.username) : undefined,
-    network: u.searchParams.get('type') || 'tcp',
-    tls: (u.searchParams.get('security') || '').toLowerCase() === 'tls',
-    host: u.searchParams.get('host') || u.searchParams.get('sni') || '',
-    path: u.searchParams.get('path') || '/',
-    sni: u.searchParams.get('sni') || u.searchParams.get('host') || '',
-    fp: u.searchParams.get('fp') || '',
-    alpn: u.searchParams.get('alpn') || '',
-    flow: u.searchParams.get('flow') || '',
-  };
-}
-
-function parseRawLinks(input) {
-  const lines = String(input || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const result = [];
-  for (const line of lines) {
-    if (line.startsWith('vmess://')) {
-      result.push(parseVmess(line));
-      continue;
-    }
-    if (line.startsWith('vless://')) {
-      result.push(parseUrlLike(line, 'vless'));
-      continue;
-    }
-    if (line.startsWith('trojan://')) {
-      result.push(parseUrlLike(line, 'trojan'));
-      continue;
-    }
-    try {
-      const decoded = b64DecodeUtf8(line);
-      if (/^(vmess|vless|trojan):\/\//m.test(decoded)) {
-        result.push(...parseRawLinks(decoded));
-      }
-    } catch {}
-  }
-  return result;
-}
-
-function buildNodes(baseNodes, preferredEndpoints, options = {}) {
-  const output = [];
-  const prefix = (options.namePrefix || '').trim();
-  let counter = 0;
-  for (const node of baseNodes) {
-    for (const ep of preferredEndpoints) {
-      counter += 1;
-      const nameParts = [];
-      if (node.name) nameParts.push(node.name);
-      if (prefix) nameParts.push(prefix);
-      if (ep.remark) nameParts.push(ep.remark);
-      else nameParts.push(String(counter));
-      output.push({
-        ...node,
-        name: nameParts.join(' | '),
-        server: ep.server,
-        port: ep.port || node.port,
-        host: options.keepOriginalHost ? node.host : '',
-        sni: options.keepOriginalHost ? node.sni : '',
-      });
-    }
-  }
-  return output;
-}
-
-function encodeVmess(node) {
-  const obj = {
-    v: '2',
-    ps: node.name,
-    add: node.server,
-    port: String(node.port),
-    id: node.uuid,
-    aid: '0',
-    scy: node.cipher || 'auto',
-    net: node.network || 'ws',
-    type: 'none',
-    host: node.host || '',
-    path: node.path || '/',
-    tls: node.tls ? 'tls' : '',
-    sni: node.sni || '',
-    alpn: node.alpn || '',
-    fp: node.fp || '',
-  };
-  return 'vmess://' + b64EncodeUtf8(JSON.stringify(obj));
-}
-
-function encodeVless(node) {
-  const url = new URL(`vless://${encodeURIComponent(node.uuid)}@${node.server}:${node.port}`);
-  url.searchParams.set('type', node.network || 'ws');
-  if (node.tls) url.searchParams.set('security', 'tls');
-  if (node.host) url.searchParams.set('host', node.host);
-  if (node.sni) url.searchParams.set('sni', node.sni);
-  if (node.path) url.searchParams.set('path', node.path);
-  if (node.alpn) url.searchParams.set('alpn', node.alpn);
-  if (node.fp) url.searchParams.set('fp', node.fp);
-  if (node.flow) url.searchParams.set('flow', node.flow);
-  url.hash = node.name;
-  return url.toString();
-}
-
-function encodeTrojan(node) {
-  const url = new URL(`trojan://${encodeURIComponent(node.password)}@${node.server}:${node.port}`);
-  if (node.network) url.searchParams.set('type', node.network);
-  if (node.tls) url.searchParams.set('security', 'tls');
-  if (node.host) url.searchParams.set('host', node.host);
-  if (node.sni) url.searchParams.set('sni', node.sni);
-  if (node.path) url.searchParams.set('path', node.path);
-  if (node.alpn) url.searchParams.set('alpn', node.alpn);
-  if (node.fp) url.searchParams.set('fp', node.fp);
-  url.hash = node.name;
-  return url.toString();
-}
-
-function renderRaw(nodes) {
-  const lines = nodes
-    .map((node) => {
-      if (node.type === 'vmess') return encodeVmess(node);
-      if (node.type === 'vless') return encodeVless(node);
-      if (node.type === 'trojan') return encodeTrojan(node);
-      return '';
-    })
-    .filter(Boolean);
-  return b64EncodeUtf8(lines.join('\n'));
-}
-
-function renderClash(nodes) {
-  const proxies = nodes
-    .map((node) => {
-      if (node.type === 'vmess') {
-        const lines = [
-          `  - name: "${escapeYaml(node.name)}"`,
-          `    type: vmess`,
-          `    server: ${node.server}`,
-          `    port: ${node.port}`,
-          `    uuid: ${node.uuid}`,
-          `    alterId: 0`,
-          `    cipher: ${node.cipher || 'auto'}`,
-          `    udp: true`,
-          `    tls: ${node.tls ? 'true' : 'false'}`,
-          `    network: ${node.network || 'ws'}`,
-        ];
-
-        if (node.sni) {
-          lines.push(`    servername: "${escapeYaml(node.sni)}"`);
-        }
-
-        if ((node.network || 'ws') === 'ws') {
-          lines.push(
-            `    ws-opts:`,
-            `      path: "${escapeYaml(node.path || '/')}"`,
-            `      headers:`,
-            `        Host: "${escapeYaml(node.host || node.sni || '')}"`
-          );
-        }
-
-        return lines.join('\n');
-      }
-
-      if (node.type === 'vless') {
-        const lines = [
-          `  - name: "${escapeYaml(node.name)}"`,
-          `    type: vless`,
-          `    server: ${node.server}`,
-          `    port: ${node.port}`,
-          `    uuid: ${node.uuid}`,
-          `    udp: true`,
-          `    tls: ${node.tls ? 'true' : 'false'}`,
-          `    network: ${node.network || 'ws'}`,
-        ];
-
-        if (node.sni) {
-          lines.push(`    servername: "${escapeYaml(node.sni)}"`);
-        }
-
-        if ((node.network || 'ws') === 'ws') {
-          lines.push(
-            `    ws-opts:`,
-            `      path: "${escapeYaml(node.path || '/')}"`,
-            `      headers:`,
-            `        Host: "${escapeYaml(node.host || node.sni || '')}"`
-          );
-        }
-
-        return lines.join('\n');
-      }
-
-      if (node.type === 'trojan') {
-        const lines = [
-          `  - name: "${escapeYaml(node.name)}"`,
-          `    type: trojan`,
-          `    server: ${node.server}`,
-          `    port: ${node.port}`,
-          `    password: "${escapeYaml(node.password || '')}"`,
-          `    udp: true`,
-        ];
-
-        if (node.sni) {
-          lines.push(`    sni: "${escapeYaml(node.sni)}"`);
-        }
-
-        if (node.tls !== false) {
-          lines.push(`    tls: true`);
-        }
-
-        if (node.network) {
-          lines.push(`    network: ${node.network}`);
-        }
-
-        if (node.network === 'ws') {
-          lines.push(
-            `    ws-opts:`,
-            `      path: "${escapeYaml(node.path || '/')}"`,
-            `      headers:`,
-            `        Host: "${escapeYaml(node.host || node.sni || '')}"`
-          );
-        }
-
-        return lines.join('\n');
-      }
-
-      return '';
-    })
-    .filter(Boolean);
-
-  const proxyNames = nodes.map(
-    (node) => `      - "${escapeYaml(node.name)}"`
-  );
-
-  const allGroupMembers = [
-    `      - "自动选择"`,
-    ...proxyNames,
-    `      - DIRECT`,
-  ];
-
-  const autoGroupMembers = proxyNames.length ? proxyNames : [`      - DIRECT`];
-
-  return [
-    `mixed-port: 7890`,
-    `allow-lan: false`,
-    `mode: rule`,
-    `log-level: info`,
-    `ipv6: true`,
-    ``,
-    `proxies:`,
-    ...(proxies.length ? proxies : []),
-    ``,
-    `proxy-groups:`,
-    `  - name: "自动选择"`,
-    `    type: url-test`,
-    `    url: "http://www.gstatic.com/generate_204"`,
-    `    interval: 300`,
-    `    tolerance: 50`,
-    `    proxies:`,
-    ...autoGroupMembers,
-    ``,
-    `  - name: "节点选择"`,
-    `    type: select`,
-    `    proxies:`,
-    ...allGroupMembers,
-    ``,
-    `rules:`,
-    `  - MATCH,节点选择`,
-  ].join('\n');
-}
-
-function renderSurge(nodes, baseUrl, accessToken) {
-  const proxies = nodes
-    .filter((node) => node.type === 'vmess' || node.type === 'trojan')
-    .map((node) => {
-      if (node.type === 'vmess') {
-        return `${node.name} = vmess, ${node.server}, ${node.port}, username=${node.uuid}, ws=true, ws-path=${node.path || '/'}, ws-headers=Host:${node.host || ''}, tls=${node.tls ? 'true' : 'false'}, sni=${node.sni || ''}`;
-      }
-      return `${node.name} = trojan, ${node.server}, ${node.port}, password=${node.password || ''}, sni=${node.sni || ''}`;
-    });
-
-  return [
-    '[General]',
-    'skip-proxy = 127.0.0.1, localhost',
-    '',
-    '[Proxy]',
-    ...proxies,
-    '',
-    '[Proxy Group]',
-    'Proxy = select, ' +
-      nodes
-        .filter((n) => n.type === 'vmess' || n.type === 'trojan')
-        .map((n) => n.name)
-        .join(', '),
-    '',
-    '[Rule]',
-    'FINAL,Proxy',
-    '',
-    '; token-protected subscription',
-    `; ${baseUrl}?token=${accessToken}`,
-  ].join('\n');
 }
 
 function createShortId(length = 10) {
@@ -433,6 +80,23 @@ async function buildDedupHash(body) {
   return sha256Hex(JSON.stringify(normalized));
 }
 
+// 记录历史（瘦身版，防止 KV 1MB 限制超限）
+async function recordHistory(env, historyItem) {
+  try {
+    const raw = await env.SUB_STORE.get(HISTORY_INDEX_KEY);
+    let list = raw ? JSON.parse(raw) : [];
+    // 过滤同 ID 记录，插入最新项
+    list = list.filter((item) => item.id !== historyItem.id);
+    list.unshift(historyItem);
+    if (list.length > MAX_HISTORY_ITEMS) {
+      list = list.slice(0, MAX_HISTORY_ITEMS);
+    }
+    await env.SUB_STORE.put(HISTORY_INDEX_KEY, JSON.stringify(list));
+  } catch (e) {
+    console.error('Failed to update history index in KV:', e);
+  }
+}
+
 async function handleGenerate(request, env, url) {
   let body;
   try {
@@ -441,82 +105,148 @@ async function handleGenerate(request, env, url) {
     return json({ ok: false, error: '请求体不是合法 JSON' }, 400);
   }
 
-  const baseNodes = parseRawLinks(body.nodeLinks || '');
-  const preferredEndpoints = parsePreferredEndpoints(body.preferredIps || '');
+  let baseNodes, preferredEndpoints, warnings = [];
+  try {
+    const parsedNodes = parseNodeLinks(body.nodeLinks || '');
+    baseNodes = parsedNodes.nodes;
+    warnings.push(...parsedNodes.warnings);
 
-  if (!baseNodes.length) return json({ ok: false, error: '没有识别到可用节点' }, 400);
-  if (!preferredEndpoints.length) return json({ ok: false, error: '没有识别到可用优选地址' }, 400);
+    const parsedEndpoints = parsePreferredEndpoints(body.preferredIps || '');
+    preferredEndpoints = parsedEndpoints.endpoints;
+    warnings.push(...parsedEndpoints.warnings);
+  } catch (err) {
+    return json({ ok: false, error: err.message }, 400);
+  }
 
   const options = {
     namePrefix: body.namePrefix || '',
     keepOriginalHost: body.keepOriginalHost !== false,
   };
 
-  const nodes = buildNodes(baseNodes, preferredEndpoints, options);
+  const expanded = expandNodes(baseNodes, preferredEndpoints, options);
+  const nodes = expanded.nodes;
+  warnings.push(...expanded.warnings);
 
+  const createdAt = new Date().toISOString();
+  
+  // 完整负载：写入单挑订阅的详情 KV
   const payload = {
     version: 1,
-    createdAt: new Date().toISOString(),
+    createdAt,
     options,
     nodes,
+    inputMeta: {
+      nodeLinks: body.nodeLinks,
+      preferredIps: body.preferredIps,
+      namePrefix: body.namePrefix || '',
+      keepOriginalHost: body.keepOriginalHost !== false,
+    }
   };
 
   const dedupHash = await buildDedupHash(body);
   const dedupKey = `dedup:${dedupHash}`;
 
   let id = await env.SUB_STORE.get(dedupKey);
+  const ttl = 60 * 60 * 24 * 30; // 30天有效
 
   if (!id) {
     id = await createUniqueShortId(env);
-    const ttl = 60 * 60 * 24 * 7; // 7天
-
-    await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(payload), {
-      expirationTtl: ttl,
-    });
-
-    await env.SUB_STORE.put(dedupKey, id, {
-      expirationTtl: ttl,
-    });
+    await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(payload), { expirationTtl: ttl });
+    await env.SUB_STORE.put(dedupKey, id, { expirationTtl: ttl });
   }
 
-  const origin = url.origin;
   const accessToken = env.SUB_ACCESS_TOKEN || '';
-  const withToken = (target) =>
-    `${origin}/sub/${id}${
-      target
-        ? `?target=${target}&token=${encodeURIComponent(accessToken)}`
-        : `?token=${encodeURIComponent(accessToken)}`
-    }`;
+  const urls = buildShareUrls(url.origin, id, accessToken);
 
-  return json({
-    ok: true,
-    storage: 'kv',
-    deduplicated: true,
-    shortId: id,
-    urls: {
-      auto: withToken(''),
-      raw: withToken('raw'),
-      clash: withToken('clash'),
-      surge: withToken('surge'),
-    },
+  // 写入历史摘要（丢弃胖文本 inputMeta）
+  await recordHistory(env, {
+    id,
+    createdAt,
+    namePrefix: options.namePrefix,
     counts: {
       inputNodes: baseNodes.length,
       preferredEndpoints: preferredEndpoints.length,
       outputNodes: nodes.length,
     },
-    preview: nodes.slice(0, 20).map((node) => ({
-      name: node.name,
-      type: node.type,
-      server: node.server,
-      port: node.port,
-      host: node.host || '',
-      sni: node.sni || '',
-    })),
-    warnings: accessToken ? [] : ['未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。'],
+    urls,
+  });
+
+  if (!accessToken) {
+    warnings.push('未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。');
+  }
+
+  return json({
+    ok: true,
+    storage: 'kv',
+    shortId: id,
+    urls,
+    counts: {
+      inputNodes: baseNodes.length,
+      preferredEndpoints: preferredEndpoints.length,
+      outputNodes: nodes.length,
+    },
+    preview: summarizeNodes(nodes, 20),
+    warnings,
   });
 }
 
-function validateAccessToken(url, env) {
+async function handleGetHistory(env) {
+  try {
+    const raw = await env.SUB_STORE.get(HISTORY_INDEX_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return json({ ok: true, list });
+  } catch (e) {
+    return json({ ok: false, error: '读取历史记录失败' }, 500);
+  }
+}
+
+async function handleGetDetail(url, env) {
+  const id = url.searchParams.get('id');
+  if (!id) return json({ ok: false, error: '缺少 ID 参数' }, 400);
+
+  try {
+    const raw = await env.SUB_STORE.get(`sub:${id}`);
+    if (!raw) return json({ ok: false, error: '记录不存在或已过期' }, 404);
+    
+    const record = JSON.parse(raw);
+    return json({ ok: true, inputMeta: record.inputMeta });
+  } catch (e) {
+    return json({ ok: false, error: '读取详情失败' }, 500);
+  }
+}
+
+async function handleDeleteHistory(url, env) {
+  const id = url.searchParams.get('id');
+  if (!id) return json({ ok: false, error: '缺少 ID 参数' }, 400);
+
+  try {
+    await env.SUB_STORE.delete(`sub:${id}`);
+    const raw = await env.SUB_STORE.get(HISTORY_INDEX_KEY);
+    if (raw) {
+      let list = JSON.parse(raw);
+      list = list.filter((item) => item.id !== id);
+      await env.SUB_STORE.put(HISTORY_INDEX_KEY, JSON.stringify(list));
+    }
+    return json({ ok: true });
+  } catch (e) {
+    return json({ ok: false, error: '删除记录失败' }, 500);
+  }
+}
+
+// 通用 /api/ 路由鉴权拦截器
+function checkApiAuth(url, request, env) {
+  const expected = env.SUB_ACCESS_TOKEN;
+  if (!expected) return null; // 服务端未配置，则放行
+
+  const provided = url.searchParams.get('token') || (request.headers.get('Authorization') || '').replace('Bearer ', '');
+  if (provided !== expected) {
+    return json({ ok: false, error: '无权访问：Token 错误或未提供' }, 403);
+  }
+  return null;
+}
+
+// 订阅客户端拉取链接的专属鉴权
+function validateSubToken(url, env) {
   const expected = env.SUB_ACCESS_TOKEN;
   if (!expected) return { ok: true };
   const provided = url.searchParams.get('token') || '';
@@ -526,31 +256,32 @@ function validateAccessToken(url, env) {
   return { ok: true };
 }
 
-async function handleSub(url, env) {
-  const tokenCheck = validateAccessToken(url, env);
+async function handleSub(request, url, env) {
+  const tokenCheck = validateSubToken(url, env);
   if (!tokenCheck.ok) return tokenCheck.response;
 
-  const id = url.pathname.split('/').pop();
+  const id = url.pathname.split('/')[2];
   if (!id) return text('missing id', 400);
 
   const raw = await env.SUB_STORE.get(`sub:${id}`);
-  if (!raw) return text('not found', 404);
+  if (!raw) return text('Subscription not found or expired', 404);
 
   const record = JSON.parse(raw);
   const nodes = record.nodes || [];
-  const target = (url.searchParams.get('target') || 'raw').toLowerCase();
 
-  if (target === 'clash') {
-    return text(renderClash(nodes), 200, 'text/yaml; charset=utf-8');
-  }
-  if (target === 'surge') {
-    return text(
-      renderSurge(nodes, url.origin + url.pathname, env.SUB_ACCESS_TOKEN || ''),
-      200,
-      'text/plain; charset=utf-8',
-    );
-  }
-  return text(renderRaw(nodes), 200, 'text/plain; charset=utf-8');
+  const ua = request.headers.get('user-agent') || '';
+  const explicitTarget = url.searchParams.get('target') || '';
+  const finalTarget = detectTarget(ua, explicitTarget);
+
+  const rendered = renderSubscription(finalTarget, nodes, url.toString());
+
+  const extraHeaders = {
+    'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(rendered.filename)}`,
+    'Profile-Update-Interval': '24',
+    'Subscription-Userinfo': 'upload=0; download=0; total=1073741824000; expire=0',
+  };
+
+  return text(rendered.body, 200, rendered.contentType, extraHeaders);
 }
 
 export default {
@@ -561,18 +292,35 @@ export default {
       return new Response(null, {
         headers: {
           'access-control-allow-origin': '*',
-          'access-control-allow-methods': 'GET,POST,OPTIONS',
-          'access-control-allow-headers': 'content-type',
+          'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
+          'access-control-allow-headers': 'content-type, authorization',
         },
       });
     }
 
-    if (request.method === 'POST' && url.pathname === '/api/generate') {
-      return handleGenerate(request, env, url);
+    // 后台管理 API 统一防护网关
+    if (url.pathname.startsWith('/api/')) {
+      const authError = checkApiAuth(url, request, env);
+      if (authError) return authError;
+
+      if (request.method === 'POST' && url.pathname === '/api/generate') {
+        return handleGenerate(request, env, url);
+      }
+      if (request.method === 'GET' && url.pathname === '/api/history') {
+        return handleGetHistory(env);
+      }
+      if (request.method === 'DELETE' && url.pathname === '/api/history') {
+        return handleDeleteHistory(url, env);
+      }
+      if (request.method === 'GET' && url.pathname === '/api/detail') {
+        return handleGetDetail(url, env);
+      }
+      
+      return json({ ok: false, error: '接口不存在' }, 404);
     }
 
     if (request.method === 'GET' && url.pathname.startsWith('/sub/')) {
-      return handleSub(url, env);
+      return handleSub(request, url, env);
     }
 
     return env.ASSETS.fetch(request);
