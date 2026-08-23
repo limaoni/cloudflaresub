@@ -51,10 +51,7 @@
               id="preferredIps"
               name="preferredIps"
               rows="8"
-              placeholder="示例：
-104.16.1.2#HK-01
-104.17.2.3:2053#HK-02
-cf.example.com:443#US-Edge"
+              placeholder="示例：&#10;104.16.1.2#HK-01&#10;104.17.2.3:2053#HK-02&#10;cf.example.com:443#US-Edge"
               required
             ></textarea>
             <p class="hint">
@@ -67,10 +64,15 @@ cf.example.com:443#US-Edge"
               <label for="namePrefix">3. 备注前缀（可选）</label>
               <input id="namePrefix" name="namePrefix" type="text" placeholder="例如 CF" />
             </div>
-            <div class="checkbox-wrap">
-              <input id="keepOriginalHost" name="keepOriginalHost" type="checkbox" checked />
-              <label for="keepOriginalHost">保留原节点 Host / SNI（推荐）</label>
+            <div>
+              <label for="apiToken">4. 访问凭证（必填项）</label>
+              <input id="apiToken" type="password" placeholder="若服务端有设置 SUB_ACCESS_TOKEN" />
             </div>
+          </div>
+
+          <div class="checkbox-wrap" style="margin-top: 14px; margin-bottom: 24px;">
+            <input id="keepOriginalHost" name="keepOriginalHost" type="checkbox" checked />
+            <label for="keepOriginalHost">保留原节点 Host / SNI（推荐）</label>
           </div>
 
           <div class="actions">
@@ -93,7 +95,7 @@ cf.example.com:443#US-Edge"
             <ul>
               <li><strong>V2rayN：</strong> 用原始订阅链接</li>
               <li><strong>Shadowrocket：</strong> 用原始订阅链接</li>
-              <li><strong>Clash / Mihomo：</strong> 用 Clash 订阅链接</li>
+              <li><strong>Clash / Mihomo / Verge：</strong> 用 Clash 订阅链接 或 自动识别</li>
               <li><strong>Surge：</strong> 用 Surge 订阅链接</li>
             </ul>
           </div>
@@ -139,7 +141,7 @@ cf.example.com:443#US-Edge"
                 </div>
                 <div>
                   <h3>自动识别</h3>
-                  <p>适合支持自动识别的客户端</p>
+                  <p>适合支持 UA 自动分发的客户端</p>
                 </div>
               </div>
             </div>
@@ -173,7 +175,7 @@ cf.example.com:443#US-Edge"
             <div class="sub-card-head">
               <div class="client-meta">
                 <div class="client-icon">
-                  <img src="/icons/clash.svg">
+                  <img src="/icons/clash.svg" alt="Clash" />
                 </div>
                 <div>
                   <h3>Clash</h3>
@@ -224,7 +226,6 @@ cf.example.com:443#US-Edge"
               <button data-copy-target="surgeUrl" type="button" class="secondary small">复制</button>
               <button data-qrcode-target="surgeUrl" type="button" class="secondary small">二维码</button>
             </div>
-            <p class="hint">当前 Surge 导出以 VMess / Trojan 为主；你的示例 VMess 节点适用。</p>
           </article>
         </div>
 
@@ -247,6 +248,21 @@ cf.example.com:443#US-Edge"
           </div>
         </div>
       </section>
+
+      <!-- 历史记录展示卡片 -->
+      <section id="historySection" class="card stack-md">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">历史记录</p>
+            <h2>生成记录管理</h2>
+            <p class="section-desc">已存储在 Cloudflare KV 中的配置历史，支持一键载入、快速复制与清理。</p>
+          </div>
+          <button id="refreshHistoryBtn" type="button" class="secondary small">刷新记录</button>
+        </div>
+        <div id="historyContainer" class="history-wrap">
+          <div class="empty-state">正在加载历史记录...</div>
+        </div>
+      </section>
     </main>
 
     <div id="qrModal" class="modal hidden" aria-hidden="true">
@@ -265,6 +281,7 @@ cf.example.com:443#US-Edge"
         </div>
       </div>
     </div>
+
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script> 
     <script type="module" src="/app.js"></script>
   </body>
