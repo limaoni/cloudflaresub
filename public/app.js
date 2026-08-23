@@ -1,3 +1,23 @@
+const apiTokenInput = document.getElementById('apiToken');
+
+// 页面加载时恢复本地保存的 Token
+if (localStorage.getItem('cf_sub_token')) {
+  apiTokenInput.value = localStorage.getItem('cf_sub_token');
+}
+
+// 统一的 API 路由拼接器：自动携带 Token 与其他参数
+function getApiUrl(path, extraParams = '') {
+  const token = apiTokenInput?.value.trim() || '';
+  if (token) localStorage.setItem('cf_sub_token', token);
+  else localStorage.removeItem('cf_sub_token');
+  
+  let qs = token ? `?token=${encodeURIComponent(token)}` : '';
+  if (extraParams) {
+    qs += qs ? `&${extraParams}` : `?${extraParams}`;
+  }
+  return path + qs;
+}
+
 const form = document.getElementById('generator-form');
 const submitBtn = document.getElementById('submitBtn');
 const fillDemoBtn = document.getElementById('fillDemoBtn');
@@ -11,10 +31,15 @@ const clashUrl = document.getElementById('clashUrl');
 const surgeUrl = document.getElementById('surgeUrl');
 const emptyState = document.getElementById('emptyState');
 
+const historyContainer = document.getElementById('historyContainer');
+const refreshHistoryBtn = document.getElementById('refreshHistoryBtn');
+
 const qrModal = document.getElementById('qrModal');
 const qrCanvas = document.getElementById('qrCanvas');
 const qrText = document.getElementById('qrText');
 const closeQrModal = document.getElementById('closeQrModal');
+
+let globalHistoryList = [];
 
 const demoVmess = [
   'vmess://ewogICJ2IjogIjIiLAogICJwcyI6ICJkZW1vLXdzLXRscyIsCiAgImFkZCI6ICJlZGdlLmV4YW1wbGUuY29tIiwKICAicG9ydCI6ICI0NDMiLAogICJpZCI6ICIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLAogICJzY3kiOiAiYXV0byIsCiAgIm5ldCI6ICJ3cyIsCiAgInRscyI6ICJ0bHMiLAogICJwYXRoIjogIi93cyIsCiAgImhvc3QiOiAiZWRnZS5leGFtcGxlLmNvbSIsCiAgInNuaSI6ICJlZGdlLmV4YW1wbGUuY29tIiwKICAiZnAiOiAiY2hyb21lIiwKICAiYWxwbiI6ICJoMixodHRwLzEuMSIKfQ=='
@@ -33,6 +58,119 @@ fillDemoBtn.addEventListener('click', () => {
   document.getElementById('keepOriginalHost').checked = true;
 });
 
+// 加载历史记录
+async function loadHistory() {
+  try {
+    const res = await fetch(getApiUrl('/api/history'));
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || '获取历史失败');
+    globalHistoryList = data.list || [];
+    renderHistoryView(globalHistoryList);
+  } catch (err) {
+    historyContainer.innerHTML = `<div class="empty-state">加载历史记录失败：${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function renderHistoryView(list) {
+  if (!list.length) {
+    historyContainer.innerHTML = '<div class="empty-state">暂无历史记录</div>';
+    return;
+  }
+
+  const html = `
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>生成时间</th>
+            <th>前缀备注</th>
+            <th>节点概况</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${list.map((item) => {
+            const timeStr = new Date(item.createdAt).toLocaleString();
+            const prefix = item.namePrefix ? escapeHtml(item.namePrefix) : '<span style="color:var(--muted)">无</span>';
+            const nodeInfo = `${item.counts.inputNodes} 原节点 × ${item.counts.preferredEndpoints} 优选 → ${item.counts.outputNodes} 节点`;
+            return `
+              <tr>
+                <td>${timeStr}</td>
+                <td><strong>${prefix}</strong></td>
+                <td>${nodeInfo}</td>
+                <td>
+                  <div class="history-btn-group">
+                    <button type="button" class="secondary small history-action-btn" onclick="window.restoreHistory('${item.id}', this)">载入</button>
+                    <button type="button" class="secondary small history-action-btn" onclick="window.copyText('${item.urls.clash}')">复制 Clash</button>
+                    <button type="button" class="secondary small history-action-btn" onclick="window.copyText('${item.urls.auto}')">复制通用</button>
+                    <button type="button" class="danger small history-action-btn" onclick="window.deleteHistory('${item.id}')">删除</button>
+                  </div>
+                </td>
+              </tr>
+            `;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+  historyContainer.innerHTML = html;
+}
+
+window.restoreHistory = async function(id, btnElement) {
+  try {
+    const originalText = btnElement.textContent;
+    btnElement.textContent = '读取中...';
+    btnElement.disabled = true;
+
+    // 按需向后端请求完整节点与优选 IP 数据
+    const res = await fetch(getApiUrl('/api/detail', `id=${encodeURIComponent(id)}`));
+    const data = await res.json();
+    
+    if (!res.ok || !data.ok) throw new Error(data.error || '获取详情失败');
+    if (!data.inputMeta) throw new Error('数据结构异常，无法恢复');
+
+    // 回填表单
+    document.getElementById('nodeLinks').value = data.inputMeta.nodeLinks || '';
+    document.getElementById('preferredIps').value = data.inputMeta.preferredIps || '';
+    document.getElementById('namePrefix').value = data.inputMeta.namePrefix || '';
+    document.getElementById('keepOriginalHost').checked = data.inputMeta.keepOriginalHost !== false;
+
+    // 页面滚动回顶部
+    form.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    
+    btnElement.textContent = originalText;
+    btnElement.disabled = false;
+  } catch (err) {
+    alert(err.message);
+    btnElement.textContent = '载入失败';
+    btnElement.disabled = false;
+  }
+};
+
+window.deleteHistory = async function(id) {
+  if (!confirm('确定要删除这条历史生成记录吗？')) return;
+  try {
+    const res = await fetch(getApiUrl('/api/history', `id=${encodeURIComponent(id)}`), { method: 'DELETE' });
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || '删除失败');
+    loadHistory();
+  } catch (err) {
+    alert(err.message);
+  }
+};
+
+window.copyText = async function(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    alert('订阅链接已复制到剪贴板！');
+  } catch {
+    prompt('请手动复制订阅链接：', text);
+  }
+};
+
+refreshHistoryBtn.addEventListener('click', loadHistory);
+
+// 生成提交
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   warningBox.classList.add('hidden');
@@ -49,7 +187,7 @@ form.addEventListener('submit', async (event) => {
   submitBtn.textContent = '生成中...';
 
   try {
-    const response = await fetch('/api/generate', {
+    const response = await fetch(getApiUrl('/api/generate'), {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -94,6 +232,7 @@ form.addEventListener('submit', async (event) => {
     }
 
     resultSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    loadHistory();
   } catch (error) {
     warningBox.textContent = error.message || '请求失败';
     warningBox.classList.remove('hidden');
@@ -103,13 +242,12 @@ form.addEventListener('submit', async (event) => {
   }
 });
 
+// 复制 / 二维码逻辑
 document.addEventListener('click', async (event) => {
   const copyButton = event.target.closest('[data-copy-target]');
   if (copyButton) {
     const input = document.getElementById(copyButton.dataset.copyTarget);
-    if (!input?.value) {
-      return;
-    }
+    if (!input?.value) return;
     try {
       await navigator.clipboard.writeText(input.value);
       const originalText = copyButton.textContent;
@@ -127,7 +265,6 @@ document.addEventListener('click', async (event) => {
   const qrButton = event.target.closest('[data-qrcode-target]');
   if (qrButton) {
     warningBox.classList.add('hidden');
-
     const input = document.getElementById(qrButton.dataset.qrcodeTarget);
     if (!input?.value) {
       warningBox.textContent = '请先生成订阅链接，再显示二维码。';
@@ -168,11 +305,5 @@ function closeQrDialog() {
   qrCanvas.innerHTML = '';
 }
 
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
+// 页面载入时读取历史
+loadHistory();
