@@ -1,3 +1,12 @@
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
 const apiTokenInput = document.getElementById('apiToken');
 
 // 页面加载时恢复本地保存的 Token
@@ -11,11 +20,11 @@ function getApiUrl(path, extraParams = '') {
   if (token) localStorage.setItem('cf_sub_token', token);
   else localStorage.removeItem('cf_sub_token');
   
-  let qs = token ? `?token=${encodeURIComponent(token)}` : '';
+  let qs = token ? `token=${encodeURIComponent(token)}` : '';
   if (extraParams) {
-    qs += qs ? `&${extraParams}` : `?${extraParams}`;
+    qs += qs ? `&${extraParams}` : extraParams;
   }
-  return path + qs;
+  return path + (qs ? `?${qs}` : '');
 }
 
 const form = document.getElementById('generator-form');
@@ -118,11 +127,12 @@ function renderHistoryView(list) {
 
 window.restoreHistory = async function(id, btnElement) {
   try {
-    const originalText = btnElement.textContent;
-    btnElement.textContent = '读取中...';
-    btnElement.disabled = true;
+    const originalText = btnElement ? btnElement.textContent : '载入';
+    if (btnElement) {
+      btnElement.textContent = '读取中...';
+      btnElement.disabled = true;
+    }
 
-    // 按需向后端请求完整节点与优选 IP 数据
     const res = await fetch(getApiUrl('/api/detail', `id=${encodeURIComponent(id)}`));
     const data = await res.json();
     
@@ -135,15 +145,19 @@ window.restoreHistory = async function(id, btnElement) {
     document.getElementById('namePrefix').value = data.inputMeta.namePrefix || '';
     document.getElementById('keepOriginalHost').checked = data.inputMeta.keepOriginalHost !== false;
 
-    // 页面滚动回顶部
+    // 页面平滑滚动回表单顶部
     form.scrollIntoView({ behavior: 'smooth', block: 'start' });
     
-    btnElement.textContent = originalText;
-    btnElement.disabled = false;
+    if (btnElement) {
+      btnElement.textContent = originalText;
+      btnElement.disabled = false;
+    }
   } catch (err) {
     alert(err.message);
-    btnElement.textContent = '载入失败';
-    btnElement.disabled = false;
+    if (btnElement) {
+      btnElement.textContent = '载入失败';
+      btnElement.disabled = false;
+    }
   }
 };
 
@@ -305,5 +319,5 @@ function closeQrDialog() {
   qrCanvas.innerHTML = '';
 }
 
-// 页面载入时读取历史
+// 页面载入时执行历史读取
 loadHistory();
