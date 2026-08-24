@@ -121,8 +121,11 @@ export function expandNodes(baseNodes, endpoints, options = {}) {
   const namePrefix = String(options.namePrefix || '').trim();
   const warnings = [];
   const expanded = [];
+  
+  // 用于记录和自动解决重名
+  const usedNames = new Map();
 
-  baseNodes.forEach((baseNode) => {
+  baseNodes.forEach((baseNode, bIdx) => {
     const originalTlsHost = getEffectiveTlsHost(baseNode);
     if (keepOriginalHost && !originalTlsHost) {
       warnings.push(`节点「${baseNode.name}」缺少 Host/SNI/原始域名，替换成优选 IP 后可能无法握手。`);
@@ -131,11 +134,33 @@ export function expandNodes(baseNodes, endpoints, options = {}) {
     endpoints.forEach((endpoint, index) => {
       const port = endpoint.port || baseNode.port;
       const label = endpoint.label || `${endpoint.host}:${port}`;
-      const suffix = namePrefix ? `${namePrefix}-${index + 1}` : label;
+      
+      let suffix = '';
+      if (namePrefix && endpoint.label) {
+        suffix = `${namePrefix} | ${endpoint.label}`;
+      } else if (namePrefix) {
+        suffix = `${namePrefix}-${index + 1}`;
+      } else {
+        suffix = label;
+      }
+
       const clone = deepClone(baseNode);
       clone.server = endpoint.host;
       clone.port = port;
-      clone.name = buildNodeName(baseNode.name, suffix);
+      
+      let rawName = buildNodeName(baseNode.name, suffix);
+      
+      // 自动检测重名并追加序号 (2), (3)... 保证名称绝对唯一
+      let finalName = rawName;
+      if (usedNames.has(rawName)) {
+        const count = usedNames.get(rawName) + 1;
+        usedNames.set(rawName, count);
+        finalName = `${rawName} (${count})`;
+      } else {
+        usedNames.set(rawName, 1);
+      }
+
+      clone.name = finalName;
       clone.endpointLabel = endpoint.label || '';
       clone.endpointSource = `${endpoint.host}:${port}`;
 
